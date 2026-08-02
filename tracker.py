@@ -1,12 +1,16 @@
 """
-NFT Gift Listing Tracker для Telegram Stars Marketplace
-=========================================================
+NFT Gift Listing Tracker + Telegram-бот (всё в одном процессе)
+================================================================
 
-Отслеживает новые листинги (выставления на продажу) подарков-коллекционок
-на внутреннем маркете Telegram через пользовательскую сессию (Telethon)
-и шлёт уведомления в указанный чат/канал.
+Компонент 1 (Telethon, пользовательская сессия): читает внутренний маркет
+подарков Telegram (payments.getResaleStarGifts) и находит новые листинги.
 
-Использует официальный MTProto-метод payments.getResaleStarGifts.
+Компонент 2 (aiogram, бот по токену): постит найденные листинги в чат по
+темам в зависимости от цены, обрабатывает /start (гейт на подписку на
+канал) и inline-кнопку "Взять лог" (удаляет пост и шлёт детали в ЛС
+забравшему).
+
+Оба компонента работают в одном asyncio-цикле через asyncio.gather.
 
 Запуск:
     python tracker.py            # обычный режим
@@ -24,11 +28,16 @@ from telethon import TelegramClient, functions
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
 
-import requests
+from aiogram import Bot, Dispatcher, F
+from aiogram.client.default import DefaultBotProperties
+from aiogram.filters import CommandStart
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.exceptions import TelegramRetryAfter, TelegramBadRequest
 
 BASE_DIR = Path(__file__).parent
 CONFIG_PATH = BASE_DIR / "config.json"
 STATE_PATH = BASE_DIR / "state.json"
+CLAIMS_PATH = BASE_DIR / "claims.json"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,158 +46,239 @@ logging.basicConfig(
 log = logging.getLogger("gift_tracker")
 
 DEBUG = "--debug" in sys.argv
-
-# Сколько элементов истории "виденных" листингов храним на каждый тип подарка
 SEEN_HISTORY_LIMIT = 500
 
 
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        raise SystemExit(f"Не найден {CONFIG_PATH}.")
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+config = load_config()
+
+bot = Bot(token=config["bot_token"], default=DefaultBotProperties(parse_mode="HTML"))
+dp = Dispatcher()
+
+SUB_CHANNEL = config.get("subscribe_channel", "rocketgiftss")  # без @
+SUB_URL = config.get("subscribe_url", f"https://t.me/{SUB_CHANNEL}")
+
+
 # ---------------------------------------------------------------------------
-# "Кнопка" в стиле style=success/danger/... — у Telegram Bot API НЕТ цветных
-# кнопок и НЕТ поддержки кастомных премиум-эмодзи (tg-emoji) в тексте кнопки —
-# только обычный unicode. Поэтому style эмулируется префиксом-эмодзи, это
-# чисто визуальный костыль, а не настоящий цвет кнопки.
+# ⚠️ Честная заметка про "стили" и premium-эмодзи в кнопках:
+# У Telegram Bot API НЕТ цветных кнопок (success/primary/...) и НЕТ поддержки
+# кастомных premium-эмодзи (tg-emoji) внутри текста кнопки — это ограничение
+# самой платформы, обойти нельзя. STYLE_EMOJI ниже — это просто префикс из
+# обычного unicode-эмодзи, визуальная имитация стиля, не настоящий цвет.
+# Premium-эмодзи по ID (tg-emoji) работают только в ТЕКСТЕ сообщений
+# (parse_mode="HTML") — там они используются по максимуму, см. emoji().
 # ---------------------------------------------------------------------------
 
-STYLE_EMOJI = {
-    "success": "✅",
-    "danger": "❌",
-    "primary": "🔵",
-    "secondary": "⚪️",
-}
+STYLE_EMOJI = {"success": "✅", "danger": "❌", "primary": "🔵", "secondary": "⚪️"}
 
 
-def premium_button(text: str, url: str, emoji_id: str = None, style: str = "primary") -> dict:
-    """
-    Аналог PremiumButton(text=..., emoji_id=..., callback_data/url=..., style=...)
-    в терминах обычной Telegram inline-кнопки.
-
-    ВАЖНО:
-    - emoji_id (кастомный премиум-эмодзи) в кнопках Telegram не отображается —
-      это ограничение самого Bot API, а не наше. Параметр принимается для
-      совместимости сигнатуры, но не используется — оставлен явно, чтобы не
-      делать вид, что он работает.
-    - "цвет" — это только эмодзи-префикс по style, реальной покраски кнопки
-      Telegram не даёт.
-    - Если у вас есть готовая реализация PremiumButton из другого проекта —
-      пришлите её, подключим вместо этой заглушки.
-    """
+def styled_button(text: str, style: str = "primary", callback_data: str = None, url: str = None) -> InlineKeyboardButton:
     prefix = STYLE_EMOJI.get(style, "")
     label = f"{prefix} {text}".strip()
-    return {"text": label, "url": url}
+    return InlineKeyboardButton(text=label, callback_data=callback_data, url=url)
+
+
+def emoji(custom_id: str, fallback: str) -> str:
+    """tg-emoji: premium-эмодзи по ID с обычным эмодзи как fallback. Только для ТЕКСТА сообщений."""
+    return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
+
+
+def html_escape(s) -> str:
+    s = str(s)
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ---------------------------------------------------------------------------
-# Отправка уведомлений через Bot API (от имени бота, не от личной сессии)
+# Гейт на подписку (/start, проверка подписки)
 # ---------------------------------------------------------------------------
 
-def send_via_bot(bot_token: str, chat_id, text: str, topic_id: int = None):
-    """
-    Отправляет сообщение от имени бота через Bot API.
-    Возвращает (ok: bool, retry_after: int | None) — чтобы вызывающий код
-    мог сам решить, ждать и повторять, или нет (раньше ошибка просто
-    логировалась и сообщение терялось навсегда).
-    """
-    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": True,
-        "reply_markup": {
-            "inline_keyboard": [[
-                premium_button(
-                    text="Забрать",
-                    url=text_gift_url(text),
-                    emoji_id="6007983438294949171",
-                    style="success",
-                )
-            ]]
-        },
-    }
-    if topic_id:
-        payload["message_thread_id"] = topic_id
+GATE_TEXT = (
+    f"{emoji('6028346797368283073', '🔔')} Подпишись на канал для использования бота.\n\n"
+    f"{emoji('6028205772117118673', 'ℹ️')} Этот парсер был разработан исключительно бесплатно для нашей тимы.\n\n"
+    f"{emoji('6039486778597970865', '⏰')} В будущем он станет платным"
+)
+
+ACCESS_TEXT = f"{emoji('5467512909909214089', '✅')} Актуальный парсер: https://t.me/+QYrEzNh9ejsyMGRh"
+
+
+def gate_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [styled_button("Подписаться", style="success", url=SUB_URL)],
+        [styled_button("Проверить подписку", style="primary", callback_data="check_sub")],
+    ])
+
+
+async def is_subscribed(user_id: int) -> bool:
+    try:
+        member = await bot.get_chat_member(f"@{SUB_CHANNEL}", user_id)
+        return member.status not in ("left", "kicked")
+    except TelegramBadRequest as e:
+        log.error(f"Не удалось проверить подписку (бот админ в @{SUB_CHANNEL}?): {e}")
+        return False
+
+
+@dp.message(CommandStart())
+async def on_start(message: Message):
+    if await is_subscribed(message.from_user.id):
+        await message.answer(ACCESS_TEXT, disable_web_page_preview=True)
+    else:
+        await message.answer(GATE_TEXT, reply_markup=gate_keyboard())
+
+
+@dp.callback_query(F.data == "check_sub")
+async def on_check_sub(callback: CallbackQuery):
+    if await is_subscribed(callback.from_user.id):
+        await callback.message.edit_text(ACCESS_TEXT, disable_web_page_preview=True)
+        await callback.answer()
+    else:
+        await callback.answer("Ты ещё не подписан(а) на канал.", show_alert=True)
+
+
+# ---------------------------------------------------------------------------
+# Claim-кнопка ("Взять лог"): удаляет пост в чате, шлёт детали забравшему в ЛС
+# ---------------------------------------------------------------------------
+
+def load_claims() -> dict:
+    if CLAIMS_PATH.exists():
+        return json.loads(CLAIMS_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def save_claims(claims: dict) -> None:
+    CLAIMS_PATH.write_text(json.dumps(claims, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def claim_keyboard(claim_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        styled_button("Взять лог", style="success", callback_data=f"claim:{claim_id}")
+    ]])
+
+
+@dp.callback_query(F.data.startswith("claim:"))
+async def on_claim(callback: CallbackQuery):
+    claim_id = callback.data.split(":", 1)[1]
+    claims = load_claims()
+    entry = claims.get(claim_id)
+
+    if not entry:
+        await callback.answer("Этот лог уже забрали или он устарел.", show_alert=True)
+        return
 
     try:
-        resp = requests.post(url, json=payload, timeout=15)
-    except requests.RequestException as e:
-        log.error(f"Bot API sendMessage network error: {e}")
-        return False, 5  # временная сетевая проблема — попробуем ещё раз чуть позже
+        await bot.delete_message(entry["chat_id"], entry["message_id"])
+    except TelegramBadRequest as e:
+        log.warning(f"Не смог удалить сообщение: {e}")
 
-    if resp.ok:
-        return True, None
+    try:
+        await bot.send_message(callback.from_user.id, entry["text"], disable_web_page_preview=True)
+        await callback.answer("Забрал(а) ✅, детали — в ЛС")
+    except TelegramBadRequest:
+        await callback.answer(
+            "Не могу написать тебе в ЛС — сначала нажми /start в личке с ботом.",
+            show_alert=True,
+        )
+        return
 
-    retry_after = None
-    if resp.status_code == 429:
-        try:
-            retry_after = resp.json().get("parameters", {}).get("retry_after")
-        except Exception:
-            pass
-        retry_after = retry_after or 5
-
-    log.error(f"Bot API sendMessage failed: {resp.status_code} {resp.text}")
-    return False, retry_after
-
-
-def text_gift_url(text: str) -> str:
-    """Достаёт ссылку на подарок (t.me/nft/...) из уже сформированного HTML-текста."""
-    import re
-    m = re.search(r'href="(https://t\.me/nft/[^"]+)"', text)
-    return m.group(1) if m else "https://t.me"
+    del claims[claim_id]
+    save_claims(claims)
 
 
 # ---------------------------------------------------------------------------
-# Очередь уведомлений — гарантирует ровно 1 сообщение в notify_interval сек.
-# и НЕ теряет сообщения при 429: то же самое сообщение ждёт retry_after и
-# отправляется повторно, следующее из очереди не отправляется, пока это не
-# ушло. Раньше при 429 сообщение просто пропадало навсегда.
+# Очередь отправки листингов — 1 сообщение / notify_interval сек, без потерь
+# при 429 (ждём ровно retry_after и повторяем то же сообщение).
 # ---------------------------------------------------------------------------
 
 class NotifyQueue:
     def __init__(self, config: dict):
         self.config = config
-        self.queue: asyncio.Queue[tuple[str, str]] = asyncio.Queue()
-        self.interval = float(config.get("notify_interval", 1))  # 1 сообщение / 1 сек по умолчанию
+        self.queue: asyncio.Queue = asyncio.Queue()
+        self.interval = float(config.get("notify_interval", 1))
 
-    async def put(self, listing_id: str, text: str) -> None:
-        await self.queue.put((listing_id, text))
+    async def put(self, claim_id: str, text: str, topic_id: int) -> None:
+        await self.queue.put((claim_id, text, topic_id))
 
     async def run(self) -> None:
-        bot_token = self.config.get("bot_token")
-        if not bot_token:
-            raise RuntimeError("bot_token не задан в config.json")
-
+        max_retries = int(self.config.get("notify_max_retries", 5))
         while True:
-            listing_id, text = await self.queue.get()
+            claim_id, text, topic_id = await self.queue.get()
+            attempts = 0
             while True:
-                ok, retry_after = await asyncio.to_thread(
-                    send_via_bot,
-                    bot_token,
-                    self.config["target_chat"],
-                    text,
-                    self.config.get("target_topic_id"),
-                )
-                if ok:
-                    log.info(f"Отправлено: {listing_id}")
-                    break
-                wait_s = (retry_after or 5) + 1
-                log.warning(f"Не отправлено ({listing_id}), повтор через {wait_s}s")
-                await asyncio.sleep(wait_s)
+                try:
+                    msg = await bot.send_message(
+                        chat_id=self.config["target_chat"],
+                        text=text,
+                        message_thread_id=topic_id,
+                        disable_web_page_preview=True,
+                        reply_markup=claim_keyboard(claim_id),
+                    )
+                except TelegramRetryAfter as e:
+                    # Реальный флуд-лимит — ждём ровно столько, сколько сказал Telegram,
+                    # это не считается за "плохую" попытку и не блокирует остальные листинги надолго.
+                    log.warning(f"429, жду {e.retry_after}s ({claim_id})")
+                    await asyncio.sleep(e.retry_after + 1)
+                    continue
+                except Exception as e:
+                    attempts += 1
+                    if attempts >= max_retries:
+                        # Раньше здесь был бесконечный retry: если ОДИН листинг не мог
+                        # уйти (битый topic_id, временный бан и т.п.), очередь зависала
+                        # на нём навсегда — тот же номер долбился в лог каждые 5с, а все
+                        # более новые листинги копились за ним и не отправлялись вообще.
+                        # Теперь после max_retries попыток листинг помечается неотправленным
+                        # и очередь идёт дальше, к более новым листингам.
+                        log.error(f"Не смог отправить {claim_id} после {attempts} попыток, пропускаю: {e}")
+                        break
+                    log.warning(f"Ошибка отправки ({claim_id}), попытка {attempts}/{max_retries}, повтор через 5с: {e}")
+                    await asyncio.sleep(5)
+                    continue
+                else:
+                    claims = load_claims()
+                    claims[claim_id] = {"chat_id": msg.chat.id, "message_id": msg.message_id, "text": text}
+                    save_claims(claims)
+                    log.info(f"Отправлено: {claim_id}")
+
+                break
+
             self.queue.task_done()
             await asyncio.sleep(self.interval)
 
 
 # ---------------------------------------------------------------------------
-# Конфиг / состояние
+# Маршрутизация по темам в зависимости от цены
 # ---------------------------------------------------------------------------
 
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        raise SystemExit(
-            f"Не найден {CONFIG_PATH}. Скопируйте config.example.json -> config.json "
-            f"и заполните api_id / api_hash / target_chat."
-        )
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+def pick_topics(config: dict, stars, ton) -> list:
+    """
+    topics.all  — всё без фильтра (если задано)
+    topics.high — >= 10000 звёзд ИЛИ >= 100 TON
+    topics.low  — <= 1500 звёзд ИЛИ <= 15 TON
+    topics.mid  — всё остальное
+    """
+    topics = config.get("topics", {})
+    dest = []
+    if topics.get("all"):
+        dest.append(topics["all"])
 
+    if (stars is not None and stars >= 10000) or (ton is not None and ton >= 100):
+        tier = topics.get("high")
+    elif (stars is not None and stars <= 1500) or (ton is not None and ton <= 15):
+        tier = topics.get("low")
+    else:
+        tier = topics.get("mid")
+
+    if tier:
+        dest.append(tier)
+    return dest
+
+
+# ---------------------------------------------------------------------------
+# Конфиг / состояние трекера
+# ---------------------------------------------------------------------------
 
 def load_state() -> dict:
     if STATE_PATH.exists():
@@ -201,61 +291,59 @@ def save_state(state: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Работа с Telegram API
+# Работа с Telegram API (маркет через Telethon)
 # ---------------------------------------------------------------------------
 
 async def get_resalable_gift_types(client: TelegramClient) -> list:
-    """
-    Возвращает список типов подарков (gift_id + название), для которых
-    в принципе доступна перепродажа (флаг availability_resale).
-    """
     result = await client(functions.payments.GetStarGiftsRequest(hash=0))
     gifts = getattr(result, "gifts", [])
     resalable = []
     for g in gifts:
-        has_resale = getattr(g, "availability_resale", None)
-        if has_resale:
-            resalable.append({
-                "gift_id": g.id,
-                "title": getattr(g, "title", str(g.id)),
-            })
+        if getattr(g, "availability_resale", None):
+            resalable.append({"gift_id": g.id, "title": getattr(g, "title", str(g.id))})
     return resalable
 
 
 async def fetch_resale_page(client: TelegramClient, gift_id: int, limit: int = 25):
-    """
-    Одна страница листингов конкретного типа подарка.
-    Без sort_by_price / sort_by_num -> сортировка по времени последнего
-    изменения цены/выставления (descending) — то есть самые свежие первые.
-    """
     return await client(
-        functions.payments.GetResaleStarGiftsRequest(
-            gift_id=gift_id,
-            offset="",
-            limit=limit,
-        )
+        functions.payments.GetResaleStarGiftsRequest(gift_id=gift_id, offset="", limit=limit)
     )
 
 
 def extract_listing_id(item) -> str:
-    """
-    Уникальный идентификатор конкретного экземпляра-листинга.
-    slug обычно вида 'GiftName-1234' — он же используется в ссылке t.me/nft/<slug>.
-    """
     slug = getattr(item, "slug", None)
     if slug:
         return slug
     return str(getattr(item, "id", getattr(item, "num", "unknown")))
 
 
+def get_owner_username(owner) -> str | None:
+    """
+    Возвращает username продавца.
+
+    У пользователя с несколькими username (в т.ч. коллекционным/NFT-юзернеймом,
+    купленным на аукционе Fragment) поле `.username` в Telethon часто пустое —
+    актуальный список лежит в `.usernames` (список объектов с `.username`
+    и `.active`). Раньше бралось только старое поле `.username`, поэтому у
+    таких продавцов бот писал "неизвестен"/"продавец не найден".
+    """
+    if not owner:
+        return None
+
+    usernames = getattr(owner, "usernames", None) or []
+    if usernames:
+        active = next((u.username for u in usernames if getattr(u, "active", True) and getattr(u, "username", None)), None)
+        if active:
+            return active
+        first = next((u.username for u in usernames if getattr(u, "username", None)), None)
+        if first:
+            return first
+
+    return getattr(owner, "username", None)
+
+
 def format_price(item):
-    """
-    Возвращает (stars, ton) как числа (float/int) или (None, None).
-    Поле с ценой перепродажи — список объектов StarsAmount / StarsTonAmount,
-    а не готовая строка, поэтому их нужно разобрать по типу.
-    StarsAmount:    amount:long nanos:int      -> звёзды (amount + nanos/1e9)
-    StarsTonAmount: amount:long (в нанотонах)  -> TON (amount / 1e9)
-    """
+    """Возвращает (stars, ton) как числа или (None, None)."""
     val = None
     for attr in ("resell_stars", "resell_amount", "resale_amount", "resell_price"):
         val = getattr(item, attr, None)
@@ -288,20 +376,8 @@ def format_number(n):
     return f"{n:.2f}"
 
 
-def html_escape(s) -> str:
-    s = str(s)
-    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-
-def emoji(custom_id: str, fallback: str) -> str:
-    """tg-emoji тег: показывает premium-эмодзи по ID, с обычным эмодзи как fallback.
-    Работает только внутри ТЕКСТА СООБЩЕНИЯ (parse_mode=HTML), не в кнопках."""
-    return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
-
-
-def format_message(gift_title: str, item, users_by_id: dict) -> str:
+def format_message(gift_title: str, item, users_by_id: dict, stars, ton) -> str:
     slug = extract_listing_id(item)
-    stars, ton = format_price(item)
     attrs = getattr(item, "attributes", []) or []
 
     model = pattern = backdrop = "—"
@@ -318,13 +394,13 @@ def format_message(gift_title: str, item, users_by_id: dict) -> str:
     owner_user_id = getattr(owner_peer, "user_id", None) if owner_peer else None
     owner = users_by_id.get(owner_user_id) if owner_user_id else None
 
-    username = getattr(owner, "username", None) if owner else None
+    username = get_owner_username(owner)
     seller_line = f"@{html_escape(username)}" if username else "неизвестен"
     seller_line += f" (<code>{owner_user_id or '?'}</code>)"
 
     # ⚠️ В ответе payments.GetResaleStarGiftsRequest нет поля с "уровнем по
-    # потраченным звёздам" пользователя — такого публичного API-метода не
-    # существует, поэтому тут принципиально прочерк, а не баг.
+    # потраченным звёздам" — такого публичного API-метода нет, поэтому здесь
+    # принципиально прочерк, а не баг.
     level = "—"
 
     paid_stars = getattr(owner, "send_paid_messages_stars", None) if owner else None
@@ -354,29 +430,14 @@ def format_message(gift_title: str, item, users_by_id: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Основной цикл
+# Основной цикл трекера (Telethon)
 # ---------------------------------------------------------------------------
 
-async def main():
-    config = load_config()
-    state = load_state()
-
-    session = StringSession(config.get("session_string") or "")
-    client = TelegramClient(session, config["api_id"], config["api_hash"])
-
-    await client.start(phone=config.get("phone") or None)
-
-    if not config.get("session_string"):
-        log.info("Сохраните эту session_string в config.json, чтобы не логиниться заново:")
-        print(client.session.save())
-
+async def tracker_loop(client: TelegramClient, config: dict, state: dict, notify_queue: NotifyQueue):
     poll_interval = float(config.get("poll_interval", 4))
     request_delay = float(config.get("request_delay", 1.5))
-    gift_filter = set(config.get("gift_ids") or [])  # пусто = отслеживать все
+    gift_filter = set(config.get("gift_ids") or [])
     refresh_types_every = int(config.get("refresh_gift_types_seconds", 600))
-
-    notify_queue = NotifyQueue(config)
-    sender_task = asyncio.create_task(notify_queue.run())
 
     while True:
         try:
@@ -410,11 +471,6 @@ async def main():
                     log.info("DEBUG raw item:\n%s", items[0].stringify())
 
                 seen_key = str(gift_id)
-                # ВАЖНО: список, а не set — порядок вставки важен для корректной
-                # обрезки истории. Раньше был set(), и list(set)[-500:] мог
-                # случайно выкинуть недавно виденные id вместо старых — из-за
-                # этого уже отправленные листинги иногда снова считались
-                # "новыми" и уходили повторно.
                 seen_list = list(state["seen"].get(seen_key, []))
                 seen_ids = set(seen_list)
                 is_first_run_for_type = seen_key not in state["seen"]
@@ -426,23 +482,20 @@ async def main():
                         new_ids.append(listing_id)
                         seen_ids.add(listing_id)
                         if not is_first_run_for_type:
-                            # первый прогон по новому типу подарка — не спамим
-                            # историческими листингами, только помечаем как виденные
-                            text = format_message(title, item, users_by_id)
-                            await notify_queue.put(listing_id, text)
+                            stars, ton = format_price(item)
+                            text = format_message(title, item, users_by_id, stars, ton)
+                            for topic_id in pick_topics(config, stars, ton):
+                                claim_id = f"{listing_id}:{topic_id}"
+                                await notify_queue.put(claim_id, text, topic_id)
                             log.info(f"В очередь: {title} / {listing_id}")
 
                 if new_ids:
                     seen_list.extend(new_ids)
-                    # обрезаем строго с начала (старые первыми), список
-                    # сохраняет порядок появления в отличие от set
                     if len(seen_list) > SEEN_HISTORY_LIMIT:
                         seen_list = seen_list[-SEEN_HISTORY_LIMIT:]
                     state["seen"][seen_key] = seen_list
                     save_state(state)
 
-                # пауза между разными типами подарков, чтобы не бомбить API
-                # пачкой запросов подряд (настраивается через request_delay)
                 await asyncio.sleep(request_delay)
 
         except Exception as e:
@@ -450,6 +503,31 @@ async def main():
             await asyncio.sleep(5)
 
         await asyncio.sleep(poll_interval)
+
+
+# ---------------------------------------------------------------------------
+# Точка входа: Telethon-сессия + aiogram-бот в одном asyncio-цикле
+# ---------------------------------------------------------------------------
+
+async def main():
+    state = load_state()
+
+    session = StringSession(config.get("session_string") or "")
+    client = TelegramClient(session, config["api_id"], config["api_hash"])
+    await client.start(phone=config.get("phone") or None)
+
+    if not config.get("session_string"):
+        log.info("Сохраните эту session_string в config.json, чтобы не логиниться заново:")
+        print(client.session.save())
+
+    notify_queue = NotifyQueue(config)
+
+    log.info("Запуск: трекер маркета + бот (полинг) в одном процессе")
+    await asyncio.gather(
+        notify_queue.run(),
+        dp.start_polling(bot),
+        tracker_loop(client, config, state, notify_queue),
+    )
 
 
 if __name__ == "__main__":

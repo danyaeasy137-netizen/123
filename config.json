@@ -1,13 +1,21 @@
 {
   "api_id": 18827865,
   "api_hash": "7949436bfcb9d3da9cbf371fd4e29405",
-  "phone": "+12368513132",
-  "session_string": "1AZWarzMBu0fTAxhiklDTKKnVFCpMdGv8nuOGk9GHBd22UwKCMlw3kG4CVbUNwJJwbxKD_KE5fWZKPUkV50l0OTBzvypHiy9AWqGduqwBwKl_rd00DGyOwQ0KdgC7MTa3f8H5thtu3YVobcfxzAd-13FCPAItM0bYqnECGnJiOTjEvLH8gEZiTHDO3yLJrb5tr_4axQzFub8VWCcnKnoak1s5NNnfWAIaXGIe8pWIQ5AqaTQlTOiuF5J0i0m7TapOlmVFqmvS3eG8CarFtDHxROtdjzEPy-ZpnwOn5Q1Pnb0HJepDusKpjT5eGJ4F1Qmj2RWeEMlbxuLbJ1Voa2iKMl7PouwMjVg=",
+  "phone": "+917667266732",
+  "session_string": "1BVtsOHoBu7GmE7h9k8dLWvhXSXl0D-wJcYqBiiEm5vXwn9hhgEDzIoGSosmhIpZw-mZRxHmhTAV1a86WecloORRYs58-rdngewfp5CniJMl8BFJ_9Sct4QAWwK7aKwTBCn-sv6qxTOWe72C-JhFVUT9K8iLW45SRx3684zGc11Uwi2qXfcHfn7gYygIYXBZmm0X20nXBo0Tq8-SrZcYgW2_WBX0crptPAKPmfZC1SUZi9_Zebb4-yRMmtmgD7Db16xq_CYMFzmNryYqZAmeUJKm1UNxTGTehs5-h6vMLRb-6ybyYxhqbJ42kV_vgpjfEl4I3JrXB-tqfdJSK6nvSNlcrh46eVVE=",
   "bot_token": "8808946113:AAHYrzT9ZTUzNaTcYUCpxjiun0QiD5IO9jY",
   "target_chat": -1004423380440,
-  "target_topic_id": 3,
   "poll_interval": 1,
   "request_delay": 1.5,
   "refresh_gift_types_seconds": 600,
-  "gift_ids": []
+  "gift_ids": [],
+  "subscribe_channel": "rocketgiftss",
+  "subscribe_url": "https://t.me/rocketgiftss",
+  "notify_interval": 1,
+  "topics": {
+    "all": 3,
+    "high": 10787,
+    "low": 10808,
+    "mid": 10826
+  }
 }
