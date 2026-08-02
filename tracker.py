@@ -74,27 +74,36 @@ MAX_SELLER_LEVEL = int(config.get("notify_max_seller_level", 5))
 
 
 # ---------------------------------------------------------------------------
-# ⚠️ Честная заметка про "стили" и premium-эмодзи в кнопках:
-# У Telegram Bot API НЕТ цветных кнопок (success/primary/...) и НЕТ поддержки
-# кастомных premium-эмодзи (tg-emoji) внутри текста кнопки — это ограничение
-# самой платформы, обойти нельзя. STYLE_EMOJI ниже — это просто префикс из
-# обычного unicode-эмодзи, визуальная имитация стиля, не настоящий цвет.
-# Premium-эмодзи по ID (tg-emoji) работают только в ТЕКСТЕ сообщений
-# (parse_mode="HTML") — там они используются по максимуму, см. emoji().
+# Цветные кнопки + premium-эмодзи в кнопках — Bot API 9.4 (style, icon_custom_emoji_id).
+# Раньше я ошибочно писал, что это невозможно — это устарело, добавили позже.
+# Единственное реальное ограничение (из документации Telegram): icon_custom_emoji_id
+# в кнопках работает только если у бота куплен доп-юзернейм на Fragment, либо у
+# ВЛАДЕЛЬЦА бота есть активная Telegram Premium подписка. Если иконка не видна —
+# дело в этом, не в коде.
 # ---------------------------------------------------------------------------
 
-STYLE_EMOJI = {"success": "✅", "danger": "❌", "primary": "🔵", "secondary": "⚪️"}
-
-
-def styled_button(text: str, style: str = "primary", callback_data: str = None, url: str = None) -> InlineKeyboardButton:
-    prefix = STYLE_EMOJI.get(style, "")
-    label = f"{prefix} {text}".strip()
-    return InlineKeyboardButton(text=label, callback_data=callback_data, url=url)
+def styled_button(text: str, style: str = None, emoji_id: str = None,
+                   callback_data: str = None, url: str = None) -> InlineKeyboardButton:
+    kwargs = {"text": text}
+    if style:
+        kwargs["style"] = style
+    if emoji_id:
+        kwargs["icon_custom_emoji_id"] = emoji_id
+    if callback_data:
+        kwargs["callback_data"] = callback_data
+    if url:
+        kwargs["url"] = url
+    return InlineKeyboardButton(**kwargs)
 
 
 def emoji(custom_id: str, fallback: str) -> str:
-    """tg-emoji: premium-эмодзи по ID с обычным эмодзи как fallback. Только для ТЕКСТА сообщений."""
+    """tg-emoji: premium-эмодзи по ID с обычным эмодзи как fallback (для текста сообщений)."""
     return f'<tg-emoji emoji-id="{custom_id}">{fallback}</tg-emoji>'
+
+
+def bold(custom_id: str, fallback: str, text: str) -> str:
+    """Эмодзи-иконка + жирный текст строки, по вашему образцу."""
+    return f'{emoji(custom_id, fallback)} <b>{text}</b>'
 
 
 def html_escape(s) -> str:
@@ -107,18 +116,18 @@ def html_escape(s) -> str:
 # ---------------------------------------------------------------------------
 
 GATE_TEXT = (
-    f"{emoji('6028346797368283073', '🔔')} Подпишись на канал для использования бота.\n\n"
-    f"{emoji('6028205772117118673', 'ℹ️')} Этот парсер был разработан исключительно бесплатно для нашей тимы.\n\n"
-    f"{emoji('6039486778597970865', '⏰')} В будущем он станет платным"
+    f"{bold('6028346797368283073', '🔔', 'Подпишись на канал для использования бота.')}\n\n"
+    f"{bold('6028205772117118673', 'ℹ️', 'Этот парсер был разработан исключительно бесплатно для нашей тимы.')}\n\n"
+    f"{bold('6039486778597970865', '⏰', 'В будущем он станет платным')}"
 )
 
-ACCESS_TEXT = f"{emoji('5467512909909214089', '✅')} Актуальный парсер: https://t.me/+QYrEzNh9ejsyMGRh"
+ACCESS_TEXT = bold('5467512909909214089', '✅', 'Актуальный парсер: https://t.me/+QYrEzNh9ejsyMGRh')
 
 
 def gate_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [styled_button("Подписаться", style="success", url=SUB_URL)],
-        [styled_button("Проверить подписку", style="primary", callback_data="check_sub")],
+        [styled_button("Подписаться", style="success", emoji_id="6041720006973067267", url=SUB_URL)],
+        [styled_button("Проверить подписку", style="primary", emoji_id="6034923938486684992", callback_data="check_sub")],
     ])
 
 
@@ -164,7 +173,7 @@ def save_claims(claims: dict) -> None:
 
 def claim_keyboard(claim_id: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
-        styled_button("Взять лог", style="success", callback_data=f"claim:{claim_id}")
+        styled_button("Взять лог", style="success", emoji_id="6007983438294949171", callback_data=f"claim:{claim_id}")
     ]])
 
 
@@ -203,14 +212,18 @@ async def on_claim(callback: CallbackQuery):
 # У Telegram Bot API жёсткий лимит — не больше ~20 сообщений в минуту В ОДНУ
 # ГРУППУ (топики внутри неё это не обходят, лимит общий на чат). Это и есть
 # реальный потолок скорости — не 30/сек (тот лимит на разные чаты) и не то,
-# что можно "просто" разогнать notify_interval. Токен-бакет: держим запас
-# токенов (burst) на случай, если очередь скопилась, но в среднем не выше
-# notify_group_limit_per_min — иначе будем упираться в 429 и по факту слать
-# медленнее, а не быстрее.
+# что можно "просто" разогнать notify_interval. По вашей просьбе "максимум в
+# пределах возможностей" — notify_group_limit_per_min теперь 19 (на волосок
+# от жёсткого потолка 20, а не с запасом в 18 как раньше). Выше поднимать
+# бессмысленно: 429 будет чаще, и по факту будет медленнее, а не быстрее.
+#
+# "Минимальная очередь": вместо неограниченной asyncio.Queue — очередь с
+# потолком notify_queue_maxsize. При переполнении выкидывается САМЫЙ СТАРЫЙ
+# элемент, а не новый — то есть в очереди всегда остаются самые свежие
+# листинги, а не протухшие. Это отдельно от notify_max_age_seconds (тот
+# всё ещё подчищает то, что залежалось при отправке).
 #
 # При 429 ждём ровно retry_after и повторяем то же сообщение (это не потеря).
-# Если листинг простоял в очереди дольше notify_max_age_seconds — он уже не
-# "новый", и мы его выкидываем вместо того чтобы кидать в чат протухший лог.
 # ---------------------------------------------------------------------------
 
 class TokenBucket:
@@ -233,12 +246,41 @@ class TokenBucket:
                 await asyncio.sleep((1 - self.tokens) / self.rate)
 
 
+class FreshQueue:
+    """
+    Очередь с потолком maxsize. При переполнении выкидывает самый старый
+    элемент (FIFO-эвикшн), чтобы в очереди всегда оставались самые свежие
+    листинги, а не растущий хвост протухших.
+    """
+    def __init__(self, maxsize: int):
+        self.maxsize = max(1, maxsize)
+        self.items: list = []
+        self._event = asyncio.Event()
+
+    async def put(self, item) -> None:
+        self.items.append(item)
+        if len(self.items) > self.maxsize:
+            dropped = self.items.pop(0)
+            log.info(f"Очередь переполнена (>{self.maxsize}), выкидываю старый: {dropped[0]}")
+        self._event.set()
+
+    async def get(self):
+        while not self.items:
+            self._event.clear()
+            await self._event.wait()
+        return self.items.pop(0)
+
+    def task_done(self) -> None:
+        pass
+
+
 class NotifyQueue:
     def __init__(self, config: dict):
         self.config = config
-        self.queue: asyncio.Queue = asyncio.Queue()
+        queue_maxsize = int(config.get("notify_queue_maxsize", 10))
+        self.queue = FreshQueue(queue_maxsize)
         self.max_age = float(config.get("notify_max_age_seconds", 20))
-        group_limit = float(config.get("notify_group_limit_per_min", 18))  # запас от жёстких 20/мин
+        group_limit = float(config.get("notify_group_limit_per_min", 19))  # почти потолок 20/мин
         self.bucket = TokenBucket(group_limit)
 
     async def put(self, claim_id: str, text: str, topic_id: int) -> None:
@@ -469,7 +511,7 @@ async def get_seller_level(client: TelegramClient, user_id: int | None) -> int |
 
 def format_level_line(level: int | None) -> str:
     if level is None:
-        return "—"
+        return "0"
     if level < 0:
         return "Отрицательный"
     return str(level)
@@ -507,20 +549,20 @@ async def format_message(gift_title: str, item, users_by_id: dict, stars, ton, s
     gift_display_id = slug.split("-")[-1] if "-" in slug else slug
 
     return (
-        "🎉 <b>НОВЫЙ ЛИСТИНГ</b>\n\n"
-        f"{emoji('6032644646587338669', '🎁')} Гифт: {html_escape(gift_title)}\n"
-        f"{emoji('6037083366438737901', '💰')} Цена: {format_number(stars)} {emoji('6028338546736107668', '⭐')}"
-        f" / {format_number(ton)} {emoji('5264781253718090745', '💎')}\n"
-        f"{emoji('5938437708635443119', '📝')} Модель: {html_escape(model)}\n"
-        f"{emoji('6030466823290360017', '🖼')} Фон: {html_escape(backdrop)}\n"
-        f"{emoji('5767244474040192942', '⭐')} Узор: {html_escape(pattern)}\n"
-        f"{emoji('6035084557378654059', '👤')} Продавец: {seller_line}\n"
-        f"{emoji('5890925363067886150', '📈')} Level: {level}\n"
-        f"{emoji('6034831751308644168', '📢')} Сообщение: {message_line}\n"
-        f"{emoji('6028346797368283073', '⭐')} Статус: {status}\n"
-        f"{emoji('6028171274939797252', '▶️')} <a href=\"https://t.me/nft/{slug}\">{html_escape(gift_title.replace(' ', ''))}-{gift_display_id}</a>\n"
-        f"{emoji('6039486778597970865', '⏰')} {time.strftime('%d.%m.%Y:%H:%M:%S')}\n\n"
-        f"{emoji('5210956306952758910', '✅')} Created @ddelitpr"
+        f"{bold('5895669571058142797', '🎉', 'Новый гифт')}\n\n"
+        f"{bold('6032644646587338669', '🎁', f'Гифт: {html_escape(gift_title)}')}\n"
+        f"{emoji('6037083366438737901', '💰')} <b>Цена: {format_number(stars)} {emoji('6028338546736107668', '⭐')}"
+        f" / {format_number(ton)} {emoji('5264781253718090745', '💎')}</b>\n"
+        f"{bold('5938437708635443119', '📝', f'Модель: {html_escape(model)}')}\n"
+        f"{bold('6030466823290360017', '🖼', f'Фон: {html_escape(backdrop)}')}\n"
+        f"{bold('5767244474040192942', '⭐', f'Узор: {html_escape(pattern)}')}\n"
+        f"{emoji('6035084557378654059', '👤')} <b>Продавец: {seller_line}</b>\n"
+        f"{bold('5890925363067886150', '📈', f'Level: {level}')}\n"
+        f"{bold('6034831751308644168', '📢', f'Сообщение: {message_line}')}\n"
+        f"{bold('6028346797368283073', '⭐', f'Статус: {status}')}\n"
+        f"{emoji('6028171274939797252', '▶️')} <b><a href=\"https://t.me/nft/{slug}\">{html_escape(gift_title.replace(' ', ''))}-{gift_display_id}</a></b>\n"
+        f"{bold('6039486778597970865', '⏰', time.strftime('%d.%m.%Y:%H:%M:%S'))}\n\n"
+        f"{bold('5210956306952758910', '✅', 'Created @ddelitpr')}"
     )
 
 

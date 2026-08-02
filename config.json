@@ -11,16 +11,28 @@
   "gift_ids": [],
   "subscribe_channel": "rocketgiftss",
   "subscribe_url": "https://t.me/rocketgiftss",
-  "notify_group_limit_per_min": 18,
+  "notify_group_limit_per_min": 19,
   "notify_max_age_seconds": 20,
   "notify_max_retries": 5,
   "notify_only_free_messages": true,
   "notify_max_seller_level": 3,
-  "seller_blacklist": [7465167207, 7486030495, 5319691052, 380264387, 667555125, 5034053656, 2118693885, 6985566845, 23246329, 1848457014],
+  "seller_blacklist": [
+    7465167207,
+    7486030495,
+    5319691052,
+    380264387,
+    667555125,
+    5034053656,
+    2118693885,
+    6985566845,
+    23246329,
+    1848457014
+  ],
   "topics": {
     "all": 3,
     "high": 10851,
     "low": 10808,
     "mid": 10826
-  }
+  },
+  "notify_queue_maxsize": 10
 }
