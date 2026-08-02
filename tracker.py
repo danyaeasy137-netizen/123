@@ -63,6 +63,12 @@ dp = Dispatcher()
 SUB_CHANNEL = config.get("subscribe_channel", "rocketgiftss")  # без @
 SUB_URL = config.get("subscribe_url", f"https://t.me/{SUB_CHANNEL}")
 
+# ID продавцов, чьи листинги игнорируем (не постим вообще, но помечаем как "виденные")
+SELLER_BLACKLIST = {int(x) for x in (config.get("seller_blacklist") or [])}
+
+# Слать только листинги продавцов с бесплатными сообщениями (send_paid_messages_stars пусто/0)
+ONLY_FREE_MESSAGES = bool(config.get("notify_only_free_messages", True))
+
 
 # ---------------------------------------------------------------------------
 # ⚠️ Честная заметка про "стили" и premium-эмодзи в кнопках:
@@ -189,8 +195,11 @@ async def on_claim(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Очередь отправки листингов — 1 сообщение / notify_interval сек, без потерь
-# при 429 (ждём ровно retry_after и повторяем то же сообщение).
+# Очередь отправки листингов — 1 сообщение / notify_interval сек.
+# При 429 ждём ровно retry_after и повторяем то же сообщение (это не потеря).
+# Но если листинг простоял в очереди дольше notify_max_age_seconds — он уже
+# не "новый", и мы его выкидываем, чтобы не кидать в чат протухший лог и не
+# держать очередь; идём сразу к более свежим листингам.
 # ---------------------------------------------------------------------------
 
 class NotifyQueue:
@@ -198,14 +207,22 @@ class NotifyQueue:
         self.config = config
         self.queue: asyncio.Queue = asyncio.Queue()
         self.interval = float(config.get("notify_interval", 1))
+        self.max_age = float(config.get("notify_max_age_seconds", 20))
 
     async def put(self, claim_id: str, text: str, topic_id: int) -> None:
-        await self.queue.put((claim_id, text, topic_id))
+        await self.queue.put((claim_id, text, topic_id, time.time()))
 
     async def run(self) -> None:
         max_retries = int(self.config.get("notify_max_retries", 5))
         while True:
-            claim_id, text, topic_id = await self.queue.get()
+            claim_id, text, topic_id, queued_at = await self.queue.get()
+
+            age = time.time() - queued_at
+            if self.max_age > 0 and age > self.max_age:
+                log.info(f"Пропускаю устаревший листинг ({claim_id}), просидел в очереди {age:.0f}с")
+                self.queue.task_done()
+                continue
+
             attempts = 0
             while True:
                 try:
@@ -317,6 +334,11 @@ def extract_listing_id(item) -> str:
     return str(getattr(item, "id", getattr(item, "num", "unknown")))
 
 
+def get_owner_id(item):
+    owner_peer = getattr(item, "owner_id", None)
+    return getattr(owner_peer, "user_id", None) if owner_peer else None
+
+
 def get_owner_username(owner) -> str | None:
     """
     Возвращает username продавца.
@@ -376,32 +398,47 @@ def format_number(n):
     return f"{n:.2f}"
 
 
+def format_level(*rarities) -> str:
+    """
+    Telegram отдаёт на каждый атрибут (модель/узор/фон) поле `rarity_permille` —
+    сколько экземпляров из 1000 имеют именно этот атрибут (меньше = реже).
+    Собственного "уровня продавца" в API нет и не было (это честно осталось
+    прочерком там, где такие данные вообще недоступны), но реальную редкость
+    конкретного гифта посчитать можно — берём самый редкий из трёх атрибутов.
+    """
+    vals = [r for r in rarities if r is not None]
+    if not vals:
+        return "—"
+    rarest = min(vals)
+    return f"{rarest / 10:.1f}% (1 из {round(1000 / rarest)})" if rarest else "<0.1%"
+
+
 def format_message(gift_title: str, item, users_by_id: dict, stars, ton) -> str:
     slug = extract_listing_id(item)
     attrs = getattr(item, "attributes", []) or []
 
     model = pattern = backdrop = "—"
+    model_rarity = pattern_rarity = backdrop_rarity = None
     for a in attrs:
         cls_name = type(a).__name__.lower()
         if "model" in cls_name:
             model = getattr(a, "name", model)
+            model_rarity = getattr(a, "rarity_permille", None)
         elif "pattern" in cls_name:
             pattern = getattr(a, "name", pattern)
+            pattern_rarity = getattr(a, "rarity_permille", None)
         elif "backdrop" in cls_name:
             backdrop = getattr(a, "name", backdrop)
+            backdrop_rarity = getattr(a, "rarity_permille", None)
 
-    owner_peer = getattr(item, "owner_id", None)
-    owner_user_id = getattr(owner_peer, "user_id", None) if owner_peer else None
+    owner_user_id = get_owner_id(item)
     owner = users_by_id.get(owner_user_id) if owner_user_id else None
 
     username = get_owner_username(owner)
     seller_line = f"@{html_escape(username)}" if username else "неизвестен"
     seller_line += f" (<code>{owner_user_id or '?'}</code>)"
 
-    # ⚠️ В ответе payments.GetResaleStarGiftsRequest нет поля с "уровнем по
-    # потраченным звёздам" — такого публичного API-метода нет, поэтому здесь
-    # принципиально прочерк, а не баг.
-    level = "—"
+    level = format_level(model_rarity, pattern_rarity, backdrop_rarity)
 
     paid_stars = getattr(owner, "send_paid_messages_stars", None) if owner else None
     message_line = f"{format_number(paid_stars)} {emoji('6028338546736107668', '⭐')}" if paid_stars else "Бесплатно"
@@ -481,6 +518,15 @@ async def tracker_loop(client: TelegramClient, config: dict, state: dict, notify
                     if listing_id not in seen_ids:
                         new_ids.append(listing_id)
                         seen_ids.add(listing_id)
+                        owner_id = get_owner_id(item)
+                        if owner_id in SELLER_BLACKLIST:
+                            log.info(f"Продавец {owner_id} в чёрном списке, пропускаю {listing_id}")
+                            continue
+                        owner = users_by_id.get(owner_id) if owner_id else None
+                        paid_stars = getattr(owner, "send_paid_messages_stars", None) if owner else None
+                        if ONLY_FREE_MESSAGES and paid_stars:
+                            log.info(f"У продавца {owner_id} платные сообщения ({paid_stars}⭐), пропускаю {listing_id}")
+                            continue
                         if not is_first_run_for_type:
                             stars, ton = format_price(item)
                             text = format_message(title, item, users_by_id, stars, ton)

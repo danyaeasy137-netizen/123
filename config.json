@@ -12,6 +12,10 @@
   "subscribe_channel": "rocketgiftss",
   "subscribe_url": "https://t.me/rocketgiftss",
   "notify_interval": 1,
+  "notify_max_age_seconds": 20,
+  "notify_max_retries": 5,
+  "notify_only_free_messages": true,
+  "seller_blacklist": [7465167207, 7486030495, 5319691052, 380264387],
   "topics": {
     "all": 3,
     "high": 10787,
