@@ -69,6 +69,9 @@ SELLER_BLACKLIST = {int(x) for x in (config.get("seller_blacklist") or [])}
 # Слать только листинги продавцов с бесплатными сообщениями (send_paid_messages_stars пусто/0)
 ONLY_FREE_MESSAGES = bool(config.get("notify_only_free_messages", True))
 
+# Не слать листинги продавцов с рейтинговым уровнем профиля выше этого значения
+MAX_SELLER_LEVEL = int(config.get("notify_max_seller_level", 5))
+
 
 # ---------------------------------------------------------------------------
 # ⚠️ Честная заметка про "стили" и premium-эмодзи в кнопках:
@@ -195,19 +198,48 @@ async def on_claim(callback: CallbackQuery):
 
 
 # ---------------------------------------------------------------------------
-# Очередь отправки листингов — 1 сообщение / notify_interval сек.
+# Очередь отправки листингов.
+#
+# У Telegram Bot API жёсткий лимит — не больше ~20 сообщений в минуту В ОДНУ
+# ГРУППУ (топики внутри неё это не обходят, лимит общий на чат). Это и есть
+# реальный потолок скорости — не 30/сек (тот лимит на разные чаты) и не то,
+# что можно "просто" разогнать notify_interval. Токен-бакет: держим запас
+# токенов (burst) на случай, если очередь скопилась, но в среднем не выше
+# notify_group_limit_per_min — иначе будем упираться в 429 и по факту слать
+# медленнее, а не быстрее.
+#
 # При 429 ждём ровно retry_after и повторяем то же сообщение (это не потеря).
-# Но если листинг простоял в очереди дольше notify_max_age_seconds — он уже
-# не "новый", и мы его выкидываем, чтобы не кидать в чат протухший лог и не
-# держать очередь; идём сразу к более свежим листингам.
+# Если листинг простоял в очереди дольше notify_max_age_seconds — он уже не
+# "новый", и мы его выкидываем вместо того чтобы кидать в чат протухший лог.
 # ---------------------------------------------------------------------------
+
+class TokenBucket:
+    def __init__(self, rate_per_min: float, burst: float | None = None):
+        self.rate = rate_per_min / 60.0  # токенов в секунду
+        self.capacity = burst if burst is not None else rate_per_min
+        self.tokens = self.capacity
+        self.updated = time.monotonic()
+        self.lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self.lock:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.capacity, self.tokens + (now - self.updated) * self.rate)
+                self.updated = now
+                if self.tokens >= 1:
+                    self.tokens -= 1
+                    return
+                await asyncio.sleep((1 - self.tokens) / self.rate)
+
 
 class NotifyQueue:
     def __init__(self, config: dict):
         self.config = config
         self.queue: asyncio.Queue = asyncio.Queue()
-        self.interval = float(config.get("notify_interval", 1))
         self.max_age = float(config.get("notify_max_age_seconds", 20))
+        group_limit = float(config.get("notify_group_limit_per_min", 18))  # запас от жёстких 20/мин
+        self.bucket = TokenBucket(group_limit)
 
     async def put(self, claim_id: str, text: str, topic_id: int) -> None:
         await self.queue.put((claim_id, text, topic_id, time.time()))
@@ -222,6 +254,8 @@ class NotifyQueue:
                 log.info(f"Пропускаю устаревший листинг ({claim_id}), просидел в очереди {age:.0f}с")
                 self.queue.task_done()
                 continue
+
+            await self.bucket.acquire()
 
             attempts = 0
             while True:
@@ -262,7 +296,6 @@ class NotifyQueue:
                 break
 
             self.queue.task_done()
-            await asyncio.sleep(self.interval)
 
 
 # ---------------------------------------------------------------------------
@@ -398,38 +431,63 @@ def format_number(n):
     return f"{n:.2f}"
 
 
-def format_level(*rarities) -> str:
+_stars_rating_cache: dict[int, tuple[int | None, float]] = {}
+STARS_RATING_CACHE_TTL = 1800  # 30 минут — рейтинг не меняется поминутно, кэш бережёт лимиты аккаунта
+
+
+async def get_seller_level(client: TelegramClient, user_id: int | None) -> int | None:
     """
-    Telegram отдаёт на каждый атрибут (модель/узор/фон) поле `rarity_permille` —
-    сколько экземпляров из 1000 имеют именно этот атрибут (меньше = реже).
-    Собственного "уровня продавца" в API нет и не было (это честно осталось
-    прочерком там, где такие данные вообще недоступны), но реальную редкость
-    конкретного гифта посчитать можно — берём самый редкий из трёх атрибутов.
+    Реальный рейтинг профиля Telegram (level из userFull.stars_rating — тот же,
+    что виден по тапу на корону в профиле). Может быть отрицательным. Это НЕ
+    часть обычного User из листинга, нужен отдельный запрос users.GetFullUser.
+    Кэшируем на STARS_RATING_CACHE_TTL, чтобы не долбить лимиты аккаунта одним
+    и тем же продавцом на каждый его листинг. Возвращает None, если узнать не
+    получилось (нет данных / ошибка) — в таком случае фильтр по уровню его не
+    трогает (лучше пропустить листинг, чем молча ронять всё при сбое API).
     """
-    vals = [r for r in rarities if r is not None]
-    if not vals:
+    if not user_id:
+        return None
+
+    cached = _stars_rating_cache.get(user_id)
+    if cached and time.time() - cached[1] < STARS_RATING_CACHE_TTL:
+        return cached[0]
+
+    level = None
+    try:
+        full = await client(functions.users.GetFullUserRequest(user_id))
+        rating = getattr(getattr(full, "full_user", None), "stars_rating", None)
+        if rating is not None:
+            level = getattr(rating, "level", None)
+    except FloodWaitError as e:
+        log.warning(f"FloodWait при получении рейтинга {user_id}: {e.seconds}с")
+    except Exception as e:
+        log.warning(f"Не смог получить рейтинг продавца {user_id}: {e}")
+
+    _stars_rating_cache[user_id] = (level, time.time())
+    return level
+
+
+def format_level_line(level: int | None) -> str:
+    if level is None:
         return "—"
-    rarest = min(vals)
-    return f"{rarest / 10:.1f}% (1 из {round(1000 / rarest)})" if rarest else "<0.1%"
+    if level < 0:
+        return "Отрицательный"
+    return str(level)
 
 
-def format_message(gift_title: str, item, users_by_id: dict, stars, ton) -> str:
+async def format_message(gift_title: str, item, users_by_id: dict, stars, ton, seller_level: int | None) -> str:
     slug = extract_listing_id(item)
     attrs = getattr(item, "attributes", []) or []
 
     model = pattern = backdrop = "—"
-    model_rarity = pattern_rarity = backdrop_rarity = None
     for a in attrs:
         cls_name = type(a).__name__.lower()
         if "model" in cls_name:
             model = getattr(a, "name", model)
-            model_rarity = getattr(a, "rarity_permille", None)
         elif "pattern" in cls_name:
             pattern = getattr(a, "name", pattern)
-            pattern_rarity = getattr(a, "rarity_permille", None)
         elif "backdrop" in cls_name:
             backdrop = getattr(a, "name", backdrop)
-            backdrop_rarity = getattr(a, "rarity_permille", None)
 
     owner_user_id = get_owner_id(item)
     owner = users_by_id.get(owner_user_id) if owner_user_id else None
@@ -438,7 +496,7 @@ def format_message(gift_title: str, item, users_by_id: dict, stars, ton) -> str:
     seller_line = f"@{html_escape(username)}" if username else "неизвестен"
     seller_line += f" (<code>{owner_user_id or '?'}</code>)"
 
-    level = format_level(model_rarity, pattern_rarity, backdrop_rarity)
+    level = format_level_line(seller_level)
 
     paid_stars = getattr(owner, "send_paid_messages_stars", None) if owner else None
     message_line = f"{format_number(paid_stars)} {emoji('6028338546736107668', '⭐')}" if paid_stars else "Бесплатно"
@@ -527,9 +585,13 @@ async def tracker_loop(client: TelegramClient, config: dict, state: dict, notify
                         if ONLY_FREE_MESSAGES and paid_stars:
                             log.info(f"У продавца {owner_id} платные сообщения ({paid_stars}⭐), пропускаю {listing_id}")
                             continue
+                        seller_level = await get_seller_level(client, owner_id)
+                        if seller_level is not None and seller_level > MAX_SELLER_LEVEL:
+                            log.info(f"У продавца {owner_id} уровень {seller_level} > {MAX_SELLER_LEVEL}, пропускаю {listing_id}")
+                            continue
                         if not is_first_run_for_type:
                             stars, ton = format_price(item)
-                            text = format_message(title, item, users_by_id, stars, ton)
+                            text = await format_message(title, item, users_by_id, stars, ton, seller_level)
                             for topic_id in pick_topics(config, stars, ton):
                                 claim_id = f"{listing_id}:{topic_id}"
                                 await notify_queue.put(claim_id, text, topic_id)
