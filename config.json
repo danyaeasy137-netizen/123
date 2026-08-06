@@ -33,7 +33,8 @@
     "high": 10851,
     "low": 10808,
     "mid": 10826,
-    "cn": 51014
+    "cn_cheap": 52177,
+    "cn_expensive": 52189
   },
   "notify_queue_maxsize": 10
 }

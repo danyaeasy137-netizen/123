@@ -411,14 +411,23 @@ def pick_topics(config: dict, stars, ton, is_chinese: bool = False) -> list:
     topics.high — >= 10000 звёзд ИЛИ >= 100 TON
     topics.low  — <= 1500 звёзд ИЛИ <= 15 TON
     topics.mid  — всё остальное
-    topics.cn   — листинги китайских продавцов (отдельно от остальных)
+    
+    Для китайцев:
+    topics.cn_cheap — до 3000 звёзд ИЛИ до 30 TON
+    topics.cn_expensive — от 3000 звёзд ИЛИ от 30 TON
     """
     topics = config.get("topics", {})
     dest = []
 
-    # Если продавец китаец — шлём в cn-тему (если она задана), и больше никуда
-    if is_chinese and topics.get("cn"):
-        dest.append(topics["cn"])
+    # Если продавец китаец — шлём в соответствующую cn-тему
+    if is_chinese:
+        # Проверяем цену: cheap если <=3000 звёзд ИЛИ <=30 TON
+        is_cheap = (stars is not None and stars <= 3000) or (ton is not None and ton <= 30)
+        
+        if is_cheap and topics.get("cn_cheap"):
+            dest.append(topics["cn_cheap"])
+        elif not is_cheap and topics.get("cn_expensive"):
+            dest.append(topics["cn_expensive"])
         return dest
 
     # Если это НЕ китаец — обычная маршрутизация по цене
@@ -683,7 +692,7 @@ async def tracker_loop(client: TelegramClient, config: dict, state: dict, notify
                             stars, ton = format_price(item)
                             text = await format_message(title, item, users_by_id, stars, ton, seller_level)
 
-                            # Выбираем темы для отправки (китайцы — в cn-тему)
+                            # Выбираем темы для отправки
                             for topic_id in pick_topics(config, stars, ton, is_chinese):
                                 claim_id = f"{listing_id}:{topic_id}"
                                 await notify_queue.put(claim_id, text, topic_id)
