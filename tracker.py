@@ -22,6 +22,7 @@ import json
 import logging
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 from telethon import TelegramClient, functions
@@ -109,6 +110,74 @@ def bold(custom_id: str, fallback: str, text: str) -> str:
 def html_escape(s) -> str:
     s = str(s)
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# ---------------------------------------------------------------------------
+# Функции для определения китайских продавцов
+# ---------------------------------------------------------------------------
+
+def is_likely_chinese(text: str | None) -> bool:
+    """
+    Проверяет, содержит ли текст китайские иероглифы (CJK).
+    Используется для идентификации продавцов-китайцев по нику/username.
+    """
+    if not text:
+        return False
+    for char in text:
+        try:
+            name = unicodedata.name(char)
+            if "CJK UNIFIED" in name or "CJK COMPATIBILITY" in name:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def get_owner_username(owner) -> str | None:
+    """
+    Возвращает username продавца.
+
+    У пользователя с несколькими username (в т.ч. коллекционным/NFT-юзернеймом,
+    купленным на аукционе Fragment) поле `.username` в Telethon часто пустое —
+    актуальный список лежит в `.usernames` (список объектов с `.username`
+    и `.active`). Раньше бралось только старое поле `.username`, поэтому у
+    таких продавцов бот писал "неизвестен"/"продавец не найден".
+    """
+    if not owner:
+        return None
+
+    usernames = getattr(owner, "usernames", None) or []
+    if usernames:
+        active = next((u.username for u in usernames if getattr(u, "active", True) and getattr(u, "username", None)), None)
+        if active:
+            return active
+        first = next((u.username for u in usernames if getattr(u, "username", None)), None)
+        if first:
+            return first
+
+    return getattr(owner, "username", None)
+
+
+def is_chinese_seller(owner) -> bool:
+    """
+    Определяет, является ли продавец китайцем по username и отображаемому имени.
+    """
+    if not owner:
+        return False
+
+    # Проверяем username (или коллекционные usernames)
+    username = get_owner_username(owner)
+    if username and is_likely_chinese(username):
+        return True
+
+    # Проверяем first_name и last_name
+    first_name = getattr(owner, "first_name", None) or ""
+    last_name = getattr(owner, "last_name", None) or ""
+
+    if is_likely_chinese(first_name) or is_likely_chinese(last_name):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -310,20 +379,12 @@ class NotifyQueue:
                         reply_markup=claim_keyboard(claim_id),
                     )
                 except TelegramRetryAfter as e:
-                    # Реальный флуд-лимит — ждём ровно столько, сколько сказал Telegram,
-                    # это не считается за "плохую" попытку и не блокирует остальные листинги надолго.
                     log.warning(f"429, жду {e.retry_after}s ({claim_id})")
                     await asyncio.sleep(e.retry_after + 1)
                     continue
                 except Exception as e:
                     attempts += 1
                     if attempts >= max_retries:
-                        # Раньше здесь был бесконечный retry: если ОДИН листинг не мог
-                        # уйти (битый topic_id, временный бан и т.п.), очередь зависала
-                        # на нём навсегда — тот же номер долбился в лог каждые 5с, а все
-                        # более новые листинги копились за ним и не отправлялись вообще.
-                        # Теперь после max_retries попыток листинг помечается неотправленным
-                        # и очередь идёт дальше, к более новым листингам.
                         log.error(f"Не смог отправить {claim_id} после {attempts} попыток, пропускаю: {e}")
                         break
                     log.warning(f"Ошибка отправки ({claim_id}), попытка {attempts}/{max_retries}, повтор через 5с: {e}")
@@ -341,18 +402,26 @@ class NotifyQueue:
 
 
 # ---------------------------------------------------------------------------
-# Маршрутизация по темам в зависимости от цены
+# Маршрутизация по темам в зависимости от цены и принадлежности к китайцам
 # ---------------------------------------------------------------------------
 
-def pick_topics(config: dict, stars, ton) -> list:
+def pick_topics(config: dict, stars, ton, is_chinese: bool = False) -> list:
     """
     topics.all  — всё без фильтра (если задано)
     topics.high — >= 10000 звёзд ИЛИ >= 100 TON
     topics.low  — <= 1500 звёзд ИЛИ <= 15 TON
     topics.mid  — всё остальное
+    topics.cn   — листинги китайских продавцов (отдельно от остальных)
     """
     topics = config.get("topics", {})
     dest = []
+
+    # Если продавец китаец — шлём в cn-тему (если она задана), и больше никуда
+    if is_chinese and topics.get("cn"):
+        dest.append(topics["cn"])
+        return dest
+
+    # Если это НЕ китаец — обычная маршрутизация по цене
     if topics.get("all"):
         dest.append(topics["all"])
 
@@ -412,31 +481,6 @@ def extract_listing_id(item) -> str:
 def get_owner_id(item):
     owner_peer = getattr(item, "owner_id", None)
     return getattr(owner_peer, "user_id", None) if owner_peer else None
-
-
-def get_owner_username(owner) -> str | None:
-    """
-    Возвращает username продавца.
-
-    У пользователя с несколькими username (в т.ч. коллекционным/NFT-юзернеймом,
-    купленным на аукционе Fragment) поле `.username` в Telethon часто пустое —
-    актуальный список лежит в `.usernames` (список объектов с `.username`
-    и `.active`). Раньше бралось только старое поле `.username`, поэтому у
-    таких продавцов бот писал "неизвестен"/"продавец не найден".
-    """
-    if not owner:
-        return None
-
-    usernames = getattr(owner, "usernames", None) or []
-    if usernames:
-        active = next((u.username for u in usernames if getattr(u, "active", True) and getattr(u, "username", None)), None)
-        if active:
-            return active
-        first = next((u.username for u in usernames if getattr(u, "username", None)), None)
-        if first:
-            return first
-
-    return getattr(owner, "username", None)
 
 
 def format_price(item):
@@ -631,13 +675,23 @@ async def tracker_loop(client: TelegramClient, config: dict, state: dict, notify
                         if seller_level is not None and seller_level > MAX_SELLER_LEVEL:
                             log.info(f"У продавца {owner_id} уровень {seller_level} > {MAX_SELLER_LEVEL}, пропускаю {listing_id}")
                             continue
+
+                        # Проверяем, является ли продавец китайцем
+                        is_chinese = is_chinese_seller(owner)
+
                         if not is_first_run_for_type:
                             stars, ton = format_price(item)
                             text = await format_message(title, item, users_by_id, stars, ton, seller_level)
-                            for topic_id in pick_topics(config, stars, ton):
+
+                            # Выбираем темы для отправки (китайцы — в cn-тему)
+                            for topic_id in pick_topics(config, stars, ton, is_chinese):
                                 claim_id = f"{listing_id}:{topic_id}"
                                 await notify_queue.put(claim_id, text, topic_id)
-                            log.info(f"В очередь: {title} / {listing_id}")
+
+                            if is_chinese:
+                                log.info(f"В очередь (китаец): {title} / {listing_id}")
+                            else:
+                                log.info(f"В очередь: {title} / {listing_id}")
 
                 if new_ids:
                     seen_list.extend(new_ids)
