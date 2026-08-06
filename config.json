@@ -32,7 +32,8 @@
     "all": 3,
     "high": 10851,
     "low": 10808,
-    "mid": 10826
+    "mid": 10826,
+    "cn": 51014
   },
   "notify_queue_maxsize": 10
 }
